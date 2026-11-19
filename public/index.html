@@ -97,6 +97,7 @@ main.wrap::-webkit-scrollbar{display:none}
 
 /* cards */
 .card{background:rgba(13,44,69,.7);border:1px solid var(--line);border-radius:22px;padding:18px;display:flex;flex-direction:column;gap:14px;backdrop-filter:blur(6px)}
+.note{font-size:.85rem;color:var(--amber);line-height:1.45}
 .card h2{font-family:var(--display);font-weight:800;font-size:1.05rem;letter-spacing:-.01em}
 .row{display:flex;align-items:center;justify-content:space-between;gap:12px}
 .next{font-family:var(--display);font-weight:800;font-size:2rem;letter-spacing:-.03em;font-variant-numeric:tabular-nums;line-height:1}
@@ -214,6 +215,7 @@ footer{color:var(--muted);font-size:.78rem;text-align:center;padding:0 8px}
       <button class="btn primary" id="toggle">Start reminders</button>
       <button class="btn ghost" id="test">Test ding</button>
     </div>
+    <p class="note" id="note" hidden></p>
     <div class="settings">
       <label class="f">Daily goal<select id="goal"></select></label>
       <label class="f">Ding every<select id="every"></select></label>
@@ -232,7 +234,7 @@ footer{color:var(--muted);font-size:.78rem;text-align:center;padding:0 8px}
     <ul id="log"></ul>
   </section>
 
-  <footer>The ding plays while this page is open and your phone is awake. Browsers cannot ring from a closed page. Turn your volume up.</footer>
+  <footer>Install to your home screen and tap Start reminders to get reminders even when the app is closed. Keep notifications on for Aqua Ding.</footer>
 </main>
 
 <div class="alert" id="alert" role="alertdialog" aria-modal="true" aria-labelledby="alertTitle" hidden>
@@ -246,28 +248,52 @@ footer{color:var(--muted);font-size:.78rem;text-align:center;padding:0 8px}
 </div>
 
 <script>
-if('serviceWorker' in navigator && location.protocol.indexOf('http')===0){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){});});}
-/* lock gestures: no pinch zoom, no context menu */
+/* lock gestures: no pinch zoom, no context menu, no drag */
 ['gesturestart','gesturechange','gestureend'].forEach(function(e){document.addEventListener(e,function(ev){ev.preventDefault()});});
 document.addEventListener('contextmenu',function(ev){ev.preventDefault()});
 document.addEventListener('touchmove',function(ev){if(ev.touches.length>1)ev.preventDefault()},{passive:false});
 document.addEventListener('dragstart',function(ev){ev.preventDefault()});
 document.addEventListener('wheel',function(ev){if(ev.ctrlKey)ev.preventDefault()},{passive:false});
+
 (function(){
   var $ = function(s){return document.querySelector(s)};
-  var LS = 'aqua-ding.v1';
-  var S = {goal:2500, every:45, from:8, to:22, logs:{}, amt:250};
-  try { var r = JSON.parse(localStorage.getItem(LS) || 'null'); if (r) Object.keys(S).forEach(function(k){ if (r[k] !== undefined) S[k] = r[k]; }); } catch(e){}
-  function save(){ try { localStorage.setItem(LS, JSON.stringify(S)); } catch(e){} }
+  var LS = 'aqua-ding.v2', LS_OLD = 'aqua-ding.v1';
+  var S = {goal:2500, every:45, from:8, to:22, logs:{}, amt:250, armed:false, mode:'', id:'', savedAt:0};
+  function merge(r){ if (!r) return; Object.keys(S).forEach(function(k){ if (r[k] !== undefined) S[k] = r[k]; }); }
+  try { merge(JSON.parse(localStorage.getItem(LS) || localStorage.getItem(LS_OLD) || 'null')); } catch(e){}
+
+  /* storage: localStorage plus an IndexedDB mirror (the service worker reads the mirror) */
+  var idb = null;
+  function idbOpen(cb){
+    try {
+      var r = indexedDB.open('aqua-ding', 1);
+      r.onupgradeneeded = function(){ r.result.createObjectStore('kv'); };
+      r.onsuccess = function(){ idb = r.result; cb(); };
+      r.onerror = function(){ cb(); };
+    } catch(e){ cb(); }
+  }
+  function idbPut(){ try { if (idb) idb.transaction('kv', 'readwrite').objectStore('kv').put(JSON.parse(JSON.stringify(S)), 'state'); } catch(e){} }
+  function idbGet(cb){
+    try {
+      if (!idb) return cb(null);
+      var q = idb.transaction('kv').objectStore('kv').get('state');
+      q.onsuccess = function(){ cb(q.result || null); };
+      q.onerror = function(){ cb(null); };
+    } catch(e){ cb(null); }
+  }
+  function save(){ S.savedAt = Date.now(); try { localStorage.setItem(LS, JSON.stringify(S)); } catch(e){} idbPut(); }
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch(e){}
 
   function pad(n){return n < 10 ? '0' + n : '' + n}
   function key(d){ d = d || new Date(); return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate()); }
   function total(k){ return (S.logs[k] || []).reduce(function(a,b){return a + b.ml}, 0); }
   function fmt(n){ return n.toLocaleString('en-US'); }
+  function clock(ts){ return new Date(ts).toLocaleTimeString(undefined, {hour:'numeric', minute:'2-digit'}); }
+  function tz(){ try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch(e){ return 'UTC'; } }
 
   /* wave paths: period 120, so a 120px slide loops with no seam */
   function wave(amp, phase){
-    var p = 'M-120 ' + 0, x;
+    var p = 'M-120 0', x;
     for (x = -120; x <= 480; x += 10) p += ' L' + x + ' ' + (amp * Math.sin((x + phase) / 120 * 2 * Math.PI)).toFixed(2);
     return p + ' L480 440 L-120 440 Z';
   }
@@ -279,18 +305,24 @@ document.addEventListener('wheel',function(ev){if(ev.ctrlKey)ev.preventDefault()
     var el = $(sel); el.innerHTML = '';
     vals.forEach(function(v){ var o = document.createElement('option'); o.value = v; o.textContent = label(v); if (v === cur) o.selected = true; el.appendChild(o); });
   }
-  var goals = []; for (var g = 1500; g <= 4500; g += 250) goals.push(g);
-  fill('#goal', goals, S.goal, function(v){return fmt(v) + ' ml'});
-  fill('#every', [1, 15, 20, 30, 45, 60, 90, 120], S.every, function(v){return v === 1 ? '1 min (test)' : v + ' min'});
-  fill('#from', [5,6,7,8,9,10,11,12], S.from, function(v){return pad(v) + ':00'});
-  fill('#to', [17,18,19,20,21,22,23,24], S.to, function(v){return v === 24 ? '24:00' : pad(v) + ':00'});
+  function fillControls(){
+    var goals = []; for (var g = 1500; g <= 4500; g += 250) goals.push(g);
+    fill('#goal', goals, S.goal, function(v){return fmt(v) + ' ml'});
+    fill('#every', [1, 15, 20, 30, 45, 60, 90, 120], S.every, function(v){return v === 1 ? '1 min (test)' : v + ' min'});
+    fill('#from', [5,6,7,8,9,10,11,12], S.from, function(v){return pad(v) + ':00'});
+    fill('#to', [17,18,19,20,21,22,23,24], S.to, function(v){return v === 24 ? '24:00' : pad(v) + ':00'});
+  }
+  fillControls();
   ['goal','every','from','to'].forEach(function(id){
     $('#' + id).addEventListener('change', function(e){
-      S[id] = parseInt(e.target.value, 10); save(); if (on) schedule(); render();
+      S[id] = parseInt(e.target.value, 10); save();
+      if (on) { if (mode === 'push') api('settings').then(applyServer).catch(function(){}); else schedule(); }
+      render();
     });
   });
 
-  /* audio */
+  /* ---------- sound ---------- */
+  /* Dings are real audio files played through an <audio> element, which keeps playing when the iPhone ringer is on silent. Web Audio is the fallback. */
   var ctx = null, master = null;
   function audio(){
     try {
@@ -304,7 +336,7 @@ document.addEventListener('wheel',function(ev){if(ev.ctrlKey)ev.preventDefault()
     } catch(e){ ctx = null; }
     return ctx;
   }
-  function bell(c, t, f, vol){
+  function waBell(c, t, f, vol){
     [[1,1,1.9],[2.01,.7,1.4],[2.76,.55,1.0],[4.1,.35,.6],[5.4,.22,.4]].forEach(function(p){
       var o = c.createOscillator(), g = c.createGain();
       o.type = 'sine'; o.frequency.value = f * p[0];
@@ -314,24 +346,63 @@ document.addEventListener('wheel',function(ev){if(ev.ctrlKey)ev.preventDefault()
       o.connect(g); g.connect(master); o.start(t); o.stop(t + p[2] + 0.1);
     });
   }
-  function ding(){
-    var c = audio(); if (!c) return;
-    var t = c.currentTime + 0.03;
-    [0, .55, 1.1].forEach(function(o, i){ bell(c, t + o, i === 1 ? 1319 : 988, .6); });
-    try { if (navigator.vibrate) navigator.vibrate([250, 120, 250, 120, 400]); } catch(e){}
-  }
-  function blip(){
+  function waDing(){ var c = audio(); if (!c) return; var t = c.currentTime + 0.03; [0, .55, 1.1].forEach(function(o, i){ waBell(c, t + o, i === 1 ? 1319 : 988, .6); }); }
+  function waBlip(){
     var c = audio(); if (!c) return;
     var t = c.currentTime, o = c.createOscillator(), g = c.createGain();
     o.type = 'sine'; o.frequency.setValueAtTime(520, t); o.frequency.exponentialRampToValueAtTime(1300, t + .12);
     g.gain.setValueAtTime(.0001, t); g.gain.exponentialRampToValueAtTime(.3, t + .02); g.gain.exponentialRampToValueAtTime(.0001, t + .2);
     o.connect(g); g.connect(master); o.start(t); o.stop(t + .25);
   }
-  function cheer(){
-    var c = audio(); if (!c) return;
-    var t = c.currentTime + .05;
-    [523, 659, 784, 1046, 1319].forEach(function(f, i){ bell(c, t + i * .13, f, .35); });
+  function waCheer(){ var c = audio(); if (!c) return; var t = c.currentTime + .05; [523, 659, 784, 1046, 1319].forEach(function(f, i){ waBell(c, t + i * .13, f, .35); }); }
+
+  var SR = 32000, urls = null, snd = null;
+  function wavUrl(len, level, fillFn){
+    var n = Math.floor(SR * len), f = new Float32Array(n), i, pk = 0;
+    fillFn(f);
+    for (i = 0; i < n; i++) pk = Math.max(pk, Math.abs(f[i]));
+    var g = pk ? level / pk : 1, b = new ArrayBuffer(44 + n * 2), v = new DataView(b);
+    function ws(o, s){ for (var j = 0; j < s.length; j++) v.setUint8(o + j, s.charCodeAt(j)); }
+    ws(0,'RIFF'); v.setUint32(4, 36 + n * 2, true); ws(8,'WAVE'); ws(12,'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+    v.setUint16(22, 1, true); v.setUint32(24, SR, true); v.setUint32(28, SR * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    ws(36,'data'); v.setUint32(40, n * 2, true);
+    for (i = 0; i < n; i++) v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, f[i] * g)) * 32767, true);
+    return URL.createObjectURL(new Blob([b], {type: 'audio/wav'}));
   }
+  function addBell(f, t0, fr, vol){
+    [[1,1,1.9],[2.01,.7,1.4],[2.76,.55,1.0],[4.1,.35,.6],[5.4,.22,.4]].forEach(function(p){
+      var start = Math.floor(t0 * SR), N = Math.floor(p[2] * SR), w = 2 * Math.PI * fr * p[0] / SR;
+      for (var i = 0; i < N && start + i < f.length; i++) {
+        var t = i / SR;
+        f[start + i] += Math.sin(w * i) * Math.min(1, t / 0.006) * Math.exp(-5.5 * t / p[2]) * vol * p[1];
+      }
+    });
+  }
+  function buildSounds(){
+    urls = {
+      ding: wavUrl(3.4, .98, function(f){ addBell(f, 0, 988, 1); addBell(f, .55, 1319, 1); addBell(f, 1.1, 988, 1); }),
+      blip: wavUrl(.3, .4, function(f){
+        var ph = 0;
+        for (var i = 0; i < f.length; i++) { var t = i / SR, fr = 520 * Math.pow(1300 / 520, Math.min(t / .12, 1)); ph += 2 * Math.PI * fr / SR; f[i] = Math.sin(ph) * Math.min(1, t / .02) * Math.exp(-t * 12); }
+      }),
+      cheer: wavUrl(2.2, .75, function(f){ [523, 659, 784, 1046, 1319].forEach(function(fr, i){ addBell(f, i * .13, fr, 1); }); })
+    };
+  }
+  function play(name, fallback){
+    try {
+      if (!snd) {
+        try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch(e){}
+        buildSounds(); snd = new Audio(); snd.preload = 'auto';
+      }
+      snd.src = urls[name]; snd.currentTime = 0;
+      var p = snd.play();
+      if (p && p.catch) p.catch(function(){ fallback(); });
+    } catch(e){ fallback(); }
+  }
+  function ding(){ audio(); play('ding', waDing); try { if (navigator.vibrate) navigator.vibrate([250, 120, 250, 120, 400]); } catch(e){} }
+  function blip(){ audio(); play('blip', waBlip); }
+  function cheer(){ audio(); play('cheer', waCheer); }
+
   function confetti(){
     if (window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches) return;
     for (var i = 0; i < 34; i++) {
@@ -344,35 +415,41 @@ document.addEventListener('wheel',function(ev){if(ev.ctrlKey)ev.preventDefault()
     }
   }
 
-  /* logging */
-  function add(ml){
-    var k = key(), before = total(k);
-    (S.logs[k] = S.logs[k] || []).push({t: Date.now(), ml: ml});
-    S.amt = ml; save();
-    var after = total(k);
-    if (before < S.goal && after >= S.goal) { cheer(); confetti(); } else { blip(); }
-    if (on) schedule();
-    closeAlert();
-    render();
-  }
-  document.querySelectorAll('.chip[data-ml]').forEach(function(b){
-    b.addEventListener('click', function(){ audio(); add(parseInt(b.dataset.ml, 10)); });
-  });
-  $('#customBtn').addEventListener('click', function(){
-    var f = $('#customForm'); f.hidden = !f.hidden;
-    this.setAttribute('aria-expanded', String(!f.hidden));
-    if (!f.hidden) $('#customMl').focus();
-  });
-  $('#customForm').addEventListener('submit', function(e){
-    e.preventDefault(); var v = parseInt($('#customMl').value, 10);
-    if (v >= 10 && v <= 2000) { audio(); add(v); $('#customMl').value = ''; this.hidden = true; $('#customBtn').setAttribute('aria-expanded', 'false'); }
-  });
-  $('#undo').addEventListener('click', function(){
-    var a = S.logs[key()]; if (a && a.length) { a.pop(); save(); render(); }
-  });
+  /* ---------- server sync (background push reminders) ---------- */
+  var on = false, mode = '', nextAt = 0, alertOpen = false, ringTimer = null, rings = 0, wake = null, lastFired = 0;
 
-  /* reminders */
-  var on = false, nextAt = 0, alertOpen = false, ringTimer = null, rings = 0, wake = null;
+  function ensureId(){
+    if (S.id) return;
+    var a = new Uint8Array(16); (window.crypto || window.msCrypto).getRandomValues(a);
+    S.id = Array.prototype.map.call(a, function(x){ return (x < 16 ? '0' : '') + x.toString(16); }).join('');
+    save();
+  }
+  function api(action, extra){
+    ensureId();
+    var body = Object.assign({id: S.id, action: action, settings: {every: S.every, from: S.from, to: S.to, tz: tz()}}, extra || {});
+    return fetch('/api/sync', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body)})
+      .then(function(r){ if (!r.ok) throw new Error('sync ' + r.status); return r.json(); });
+  }
+  function applyServer(r){ if (r && r.active) { on = true; mode = 'push'; nextAt = r.nextAt; } renderTimer(); }
+  function note(msg){ var n = $('#note'); n.textContent = msg || ''; n.hidden = !msg; }
+  function standalone(){ return navigator.standalone === true || (window.matchMedia && matchMedia('(display-mode: standalone)').matches); }
+  function isIOS(){ return /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); }
+  function pushSupported(){ return 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window; }
+  function b64ToU8(s){
+    s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '=';
+    var raw = atob(s), out = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+  function closeNotifs(){
+    try {
+      if (!('serviceWorker' in navigator)) return;
+      navigator.serviceWorker.getRegistration().then(function(reg){
+        if (reg && reg.getNotifications) reg.getNotifications({tag: 'aqua-ding'}).then(function(a){ a.forEach(function(n){ n.close(); }); });
+      }).catch(function(){});
+    } catch(e){}
+  }
+
   function schedule(){
     var t = Date.now() + S.every * 60000, d = new Date(t);
     if (d.getHours() < S.from) { d.setHours(S.from, 0, 0, 0); t = d.getTime(); }
@@ -382,60 +459,157 @@ document.addEventListener('wheel',function(ev){if(ev.ctrlKey)ev.preventDefault()
   function keepAwake(){
     try { if (navigator.wakeLock) navigator.wakeLock.request('screen').then(function(l){ wake = l; }).catch(function(){}); } catch(e){}
   }
-  document.addEventListener('visibilitychange', function(){ if (on && document.visibilityState === 'visible') keepAwake(); });
 
-  $('#toggle').addEventListener('click', function(){
-    audio();
-    if (!on) {
-      on = true; schedule(); keepAwake();
-      try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(function(){}); } catch(e){}
-      blip();
-    } else {
-      on = false; closeAlert();
-      try { if (wake) wake.release(); } catch(e){}
+  function startLocal(msg){
+    on = true; mode = 'local'; S.armed = true; S.mode = 'local'; save(); schedule(); keepAwake(); note(msg || ''); render();
+  }
+  function startReminders(){
+    blip();
+    if (!pushSupported()) {
+      startLocal(isIOS() && !standalone()
+        ? 'For reminders when the app is closed: tap Share, then Add to Home Screen, open Aqua Ding from your home screen, and tap Start again. Until then dings only play while this page is open.'
+        : 'This browser cannot send background reminders. Dings play while the app is open.');
+      return;
     }
+    var perm = Notification.permission;
+    var permP = perm === 'default' ? Notification.requestPermission() : Promise.resolve(perm);
+    Promise.resolve(permP).then(function(p){
+      if (p !== 'granted') { startLocal('Notifications are blocked. Turn them on in Settings, Notifications, Aqua Ding, then tap Start again. Until then dings only play while the app is open.'); return; }
+      return Promise.all([navigator.serviceWorker.ready, fetch('/api/vapid').then(function(r){ return r.json(); })]).then(function(x){
+        var reg = x[0], keyB64 = x[1].key;
+        return reg.pushManager.getSubscription().then(function(sub){
+          return sub || reg.pushManager.subscribe({userVisibleOnly: true, applicationServerKey: b64ToU8(keyB64)});
+        });
+      }).then(function(sub){
+        return api('subscribe', {sub: sub.toJSON()});
+      }).then(function(r){
+        on = true; mode = 'push'; nextAt = r.nextAt; S.armed = true; S.mode = 'push'; save(); note(''); render();
+      });
+    }).catch(function(){
+      startLocal('Could not reach the reminder server. Dings play while the app is open. Check your connection and tap Start again.');
+    });
+  }
+  function stopReminders(){
+    var was = mode;
+    on = false; mode = ''; S.armed = false; S.mode = ''; save(); closeAlert(); note('');
+    try { if (wake) wake.release(); } catch(e){}
+    if (was === 'push') api('stop').catch(function(){});
     render();
-  });
+  }
+  $('#toggle').addEventListener('click', function(){ if (on) stopReminders(); else startReminders(); });
   $('#test').addEventListener('click', function(){ ding(); });
 
+  /* resume after the app was closed */
+  function resume(){
+    if (!S.armed) return;
+    if (S.mode === 'push' && S.id) {
+      api('status').then(function(r){
+        if (r.active) applyServer(r); else { S.armed = false; S.mode = ''; save(); }
+        render();
+      }).catch(function(){ on = true; mode = 'push'; nextAt = Date.now() + S.every * 60000; render(); });
+    }
+  }
+  document.addEventListener('pointerdown', function(e){
+    if (S.armed && S.mode === 'local' && !on && !(e.target.closest && e.target.closest('#toggle'))) { audio(); startLocal(''); }
+  });
+  function refreshStatus(){
+    if (on && mode === 'push' && S.id) api('status').then(applyServer).catch(function(){});
+  }
+  document.addEventListener('visibilitychange', function(){
+    if (document.visibilityState === 'visible') { if (on && mode === 'local') keepAwake(); refreshStatus(); render(); }
+  });
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.addEventListener('message', function(e){
+      if (e.data && e.data.type === 'pushed' && document.visibilityState === 'visible' && on && !alertOpen && Date.now() - lastFired > 60000) {
+        closeNotifs(); fireAlert(); refreshStatus();
+      }
+    });
+  }
+
+  /* ---------- logging ---------- */
+  function add(ml){
+    var k = key(), before = total(k);
+    (S.logs[k] = S.logs[k] || []).push({t: Date.now(), ml: ml});
+    S.amt = ml; save();
+    var after = total(k);
+    if (before < S.goal && after >= S.goal) { cheer(); confetti(); } else { blip(); }
+    closeNotifs(); closeAlert();
+    if (on) { if (mode === 'push') api('logged').then(applyServer).catch(function(){}); else schedule(); }
+    render();
+  }
+  document.querySelectorAll('.chip[data-ml]').forEach(function(b){
+    b.addEventListener('click', function(){ add(parseInt(b.dataset.ml, 10)); });
+  });
+  $('#customBtn').addEventListener('click', function(){
+    var f = $('#customForm'); f.hidden = !f.hidden;
+    this.setAttribute('aria-expanded', String(!f.hidden));
+    if (!f.hidden) $('#customMl').focus();
+  });
+  $('#customForm').addEventListener('submit', function(e){
+    e.preventDefault(); var v = parseInt($('#customMl').value, 10);
+    if (v >= 10 && v <= 2000) { add(v); $('#customMl').value = ''; this.hidden = true; $('#customBtn').setAttribute('aria-expanded', 'false'); }
+  });
+  $('#undo').addEventListener('click', function(){
+    var a = S.logs[key()]; if (a && a.length) { a.pop(); save(); render(); }
+  });
+
+  /* ---------- in-app alert ---------- */
   function ringNow(){
     ding();
     if (++rings >= 8) { clearInterval(ringTimer); ringTimer = null; }
   }
   function fireAlert(){
-    alertOpen = true; rings = 0;
+    alertOpen = true; rings = 0; lastFired = Date.now();
     var left = Math.max(S.goal - total(key()), 0);
     $('#alertSub').textContent = left > 0 ? fmt(left) + ' ml to go today.' : 'Goal done. A little extra never hurts.';
     $('#alertLog').textContent = 'I drank ' + S.amt + ' ml';
     $('#alert').hidden = false;
     try { $('#alertLog').focus(); } catch(e){}
     ringNow(); ringTimer = setInterval(ringNow, 12000);
-    try { if ('Notification' in window && Notification.permission === 'granted') new Notification('Time to drink water', {body: fmt(left) + ' ml to go today.', requireInteraction: true}); } catch(e){}
   }
   function closeAlert(){
     alertOpen = false; $('#alert').hidden = true;
     if (ringTimer) { clearInterval(ringTimer); ringTimer = null; }
   }
   $('#alertLog').addEventListener('click', function(){ add(S.amt); });
-  $('#alertSnooze').addEventListener('click', function(){ closeAlert(); nextAt = Date.now() + 5 * 60000; render(); });
+  $('#alertSnooze').addEventListener('click', function(){
+    closeAlert(); closeNotifs();
+    if (mode === 'push') api('snooze', {minutes: 5}).then(applyServer).catch(function(){});
+    else nextAt = Date.now() + 5 * 60000;
+    render();
+  });
 
+  /* ---------- clock ---------- */
+  var curDay = key(), lastPoll = 0;
   setInterval(function(){
-    if (on && !alertOpen && Date.now() >= nextAt) fireAlert();
+    var now = Date.now();
+    if (key() !== curDay) { curDay = key(); render(); }
+    if (on && !alertOpen && document.visibilityState === 'visible') {
+      if (mode === 'local' && now >= nextAt) fireAlert();
+      /* push mode: the push message rings the app; this is the backup if the message was late */
+      else if (mode === 'push' && now >= nextAt + 20000 && now < nextAt + 120000 && now - lastFired > 60000) fireAlert();
+    }
+    if (on && mode === 'push' && document.visibilityState === 'visible' && now - lastPoll > 30000) { lastPoll = now; refreshStatus(); }
     renderTimer();
   }, 1000);
 
   function renderTimer(){
     $('#dot').className = 'dot' + (on ? ' on' : '');
-    $('#state').textContent = on ? 'Reminders on' : 'Reminders off';
     $('#toggle').textContent = on ? 'Stop reminders' : 'Start reminders';
-    if (!on) { $('#next').textContent = '--:--'; $('#nextSub').textContent = 'tap start to arm the ding'; return; }
+    if (!on) {
+      $('#state').textContent = S.armed && S.mode === 'local' ? 'Tap anywhere to resume' : 'Reminders off';
+      $('#next').textContent = '--:--';
+      $('#nextSub').textContent = 'tap start to turn on the ding';
+      return;
+    }
+    $('#state').textContent = mode === 'push' ? 'Reminders on, works when closed' : 'Reminders on, keep app open';
     var s = Math.max(0, Math.round((nextAt - Date.now()) / 1000));
     var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = s % 60;
     $('#next').textContent = (h ? h + ':' + pad(m) : pad(m)) + ':' + pad(sec);
-    $('#nextSub').textContent = 'until next ding';
+    $('#nextSub').textContent = 'next ding at ' + clock(nextAt);
   }
 
-  /* render */
+  /* ---------- render ---------- */
   function streak(){
     var d = new Date(), n = 0;
     if (total(key(d)) < S.goal) d.setDate(d.getDate() - 1);
@@ -457,7 +631,7 @@ document.addEventListener('wheel',function(ev){if(ev.ctrlKey)ev.preventDefault()
     if (!a.length) { var e = document.createElement('li'); e.innerHTML = '<span class="empty">Nothing logged yet. Tap a size above.</span>'; ul.appendChild(e); }
     a.forEach(function(x){
       var li = document.createElement('li');
-      li.innerHTML = '<span>' + new Date(x.t).toLocaleTimeString(undefined, {hour:'numeric', minute:'2-digit'}) + '</span><strong>+' + x.ml + ' ml</strong>';
+      li.innerHTML = '<span>' + clock(x.t) + '</span><strong>+' + x.ml + ' ml</strong>';
       ul.appendChild(li);
     });
 
@@ -473,7 +647,20 @@ document.addEventListener('wheel',function(ev){if(ev.ctrlKey)ev.preventDefault()
     }
     renderTimer();
   }
+
+  if ('serviceWorker' in navigator && location.protocol.indexOf('http') === 0) {
+    window.addEventListener('load', function(){ navigator.serviceWorker.register('/sw.js').catch(function(){}); });
+  }
   render();
+  idbOpen(function(){
+    idbGet(function(r){
+      if (r && (r.savedAt || 0) > S.savedAt) {
+        merge(r); try { localStorage.setItem(LS, JSON.stringify(S)); } catch(e){}
+        fillControls(); render();
+      } else idbPut();
+      resume();
+    });
+  });
 })();
 </script>
 </body>

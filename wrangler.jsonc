@@ -1,9 +1,21 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "aquading",
+  "main": "src/worker.js",
   "compatibility_date": "2026-11-01",
   "assets": {
     "directory": "./public",
-    "not_found_handling": "single-page-application"
-  }
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "REMINDER", "class_name": "Reminder" },
+      { "name": "VAPID", "class_name": "Vapid" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Reminder", "Vapid"] }
+  ]
 }
