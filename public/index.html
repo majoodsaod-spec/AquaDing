@@ -598,7 +598,7 @@ document.addEventListener('wheel',function(ev){if(ev.ctrlKey)ev.preventDefault()
       /* push mode: the push message rings the app; this is the backup if the message was late */
       else if (mode === 'push' && now >= nextAt + 20000 && now < nextAt + 120000 && now - lastFired > 60000) fireAlert();
     }
-    if (on && mode === 'push' && document.visibilityState === 'visible' && now - lastPoll > 30000) { lastPoll = now; refreshStatus(); }
+    if (on && mode === 'push' && document.visibilityState === 'visible' && now - lastPoll > 300000) { lastPoll = now; refreshStatus(); }
     renderTimer();
   }, 1000);
 
